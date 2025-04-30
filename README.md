@@ -1,19 +1,7 @@
-Fruitfly
-========
+Rusty Probe with Embassy
+========================
 
-A simple alternative debug probe firmware for the RPi debugprobe. The goal of this is to provide an
-alternative to the PIO-driven debugprobe firmware which may have too string timing for certain
-target devices.
-
-The probe implements both the SWD and JTAG interfaces. SWD is available using the DEBUG port as
-usual, while JTAG uses both DEBUG and UART with the following pin assignment:
-
-| SWD   | JTAG   | Pin | Wire         |
-| ----- | ------ | --- | ------------ |
-| SWDIO | TMS    | P14 | DEBUG yellow |
-|       | TDI    | P6  | UART yellow  |
-|       | TDO    | P4  | UART orange  |
-| SWCLK | TCLK   | P12 | DEBUG orange |
+A simple alternative debug probe firmware for the [Rusty Probe](https://github.com/probe-rs/rusty-probe) debugprobe. This firmware is written on top of embassy, and only provides CMSIS-DAP v2.
 
 The firmware uses the [bitbang-dap] crate that acts as an
 adapter between [dap-rs] and the hardware. The hardware then only needs to implement a bidirectional

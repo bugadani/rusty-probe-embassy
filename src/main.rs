@@ -33,11 +33,13 @@ async fn main(_spawner: Spawner) {
 
     // Configuration options:
     // 1. Pinout
-    let t_nrst = p.PIN_29; // Disconnected
-    let t_jtdi = p.PIN_6; // UART yellow
-    let t_jtms_swdio = p.PIN_14; // DEBUG yellow
-    let t_jtck_swclk = p.PIN_12; // DEBUG orange
-    let t_jtdo = p.PIN_4; // UART orange
+    let t_nrst = p.PIN_9;
+    let t_jtdi = p.PIN_17;
+    let t_jtms_swdio = p.PIN_10;
+    let dir_swdio = p.PIN_12;
+    let t_jtck_swclk = p.PIN_11;
+    let dir_swclk = p.PIN_19;
+    let t_jtdo = p.PIN_16;
     //let t_swo // Not supported yet
 
     // 2. Max JTAG scan chain
@@ -45,7 +47,7 @@ async fn main(_spawner: Spawner) {
 
     // 3. USB configuration
     const MANUFACTURER: &str = "me";
-    const PRODUCT: &str = "Fruitfly debug probe CMSIS-DAP";
+    const PRODUCT: &str = "Rusty Probe with Embassy CMSIS-DAP";
 
     // Create the driver, from the HAL.
     let driver = UsbDriver::new(p.USB, Irqs);
@@ -122,20 +124,20 @@ async fn main(_spawner: Spawner) {
     static SCAN_CHAIN: ConstStaticCell<[TapConfig; MAX_SCAN_CHAIN_LENGTH]> =
         ConstStaticCell::new([TapConfig::INIT; MAX_SCAN_CHAIN_LENGTH]);
     let deps = BitbangAdapter::new(
-        IoPin::new(t_nrst),
-        IoPin::new(t_jtdi),
-        IoPin::new(t_jtms_swdio),
-        IoPin::new(t_jtck_swclk),
-        IoPin::new(t_jtdo),
+        IoPin::new(t_nrst, None),
+        IoPin::new(t_jtdi, None),
+        IoPin::new(t_jtms_swdio, Some(dir_swdio)),
+        IoPin::new(t_jtck_swclk, Some(dir_swclk)),
+        IoPin::new(t_jtdo, None),
         BitDelay,
         SCAN_CHAIN.take(),
     );
     let mut dap = Dap::new(
         deps,
         Leds {
-            _power: Output::new(p.PIN_2, Level::High),
-            green: Output::new(p.PIN_15, Level::Low),
-            yellow: Output::new(p.PIN_16, Level::Low),
+            red: Output::new(p.PIN_28, Level::High),
+            green: Output::new(p.PIN_27, Level::High),
+            blue: Output::new(p.PIN_29, Level::High),
         },
         BitDelay,
         None::<NoSwo>,
@@ -191,12 +193,14 @@ impl DelayCycles for BitDelay {
 
 struct IoPin<'a> {
     pin: Flex<'a>,
+    direction_pin: Option<Flex<'a>>,
 }
 
 impl<'a> IoPin<'a> {
-    fn new(pin: Peri<'a, impl Pin>) -> Self {
+    fn new(pin: Peri<'a, impl Pin>, direction_pin: Option<Peri<'a, impl Pin>>) -> Self {
         Self {
             pin: Flex::new(pin),
+            direction_pin: direction_pin.map(Flex::new),
         }
     }
 }
@@ -204,6 +208,9 @@ impl<'a> IoPin<'a> {
 impl InputOutputPin for IoPin<'_> {
     fn set_as_output(&mut self) {
         self.pin.set_as_output();
+        if let Some(dir) = self.direction_pin.as_mut() {
+            dir.set_high();
+        }
     }
 
     fn set_high(&mut self, high: bool) {
@@ -214,6 +221,9 @@ impl InputOutputPin for IoPin<'_> {
     }
 
     fn set_as_input(&mut self) {
+        if let Some(dir) = self.direction_pin.as_mut() {
+            dir.set_low();
+        }
         self.pin.set_as_input();
     }
 
@@ -223,16 +233,16 @@ impl InputOutputPin for IoPin<'_> {
 }
 
 struct Leds<'a> {
-    _power: Output<'a>,
+    red: Output<'a>,
     green: Output<'a>,
-    yellow: Output<'a>,
+    blue: Output<'a>,
 }
 
 impl DapLeds for Leds<'_> {
     fn react_to_host_status(&mut self, host_status: dap::HostStatus) {
         match host_status {
             dap::HostStatus::Connected(c) => self.green.set_level(Level::from(c)),
-            dap::HostStatus::Running(r) => self.yellow.set_level(Level::from(r)),
+            dap::HostStatus::Running(r) => self.blue.set_level(Level::from(r)),
         }
     }
 }
