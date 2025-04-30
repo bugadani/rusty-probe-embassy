@@ -379,15 +379,15 @@ struct LedController<'a> {
 impl<'a> LedController<'a> {
     async fn run(&mut self) -> Self {
         loop {
-            let is_activity = self.update().await;
-            if is_activity {
+            if self.display() {
                 // Wait for a bit to make sure the signal can be seen.
                 Timer::after(Duration::from_millis(100)).await;
             }
+            self.update().await;
         }
     }
 
-    async fn update(&mut self) -> bool {
+    async fn update(&mut self) {
         let host_status_signal = self.signals.host_status.wait();
         let target_voltage_signal = self.signals.target_voltage.wait();
 
@@ -401,7 +401,9 @@ impl<'a> LedController<'a> {
                 self.state.host_status = None;
             }
         };
+    }
 
+    fn display(&mut self) -> bool {
         let is_activity = match (self.state.target_voltage, self.state.host_status.as_ref()) {
             (Some(current_vtarget), None)
             | (Some(current_vtarget), Some(dap::HostStatus::Connected(false))) => {
