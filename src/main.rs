@@ -240,14 +240,14 @@ impl DelayCycles for BitDelay {
 
 struct IoPin<'a> {
     pin: Flex<'a>,
-    direction_pin: Option<Flex<'a>>,
+    direction_pin: Option<Output<'a>>,
 }
 
 impl<'a> IoPin<'a> {
     fn new(pin: Peri<'a, impl Pin>, direction_pin: Option<Peri<'a, impl Pin>>) -> Self {
         Self {
             pin: Flex::new(pin),
-            direction_pin: direction_pin.map(Flex::new),
+            direction_pin: direction_pin.map(|pin| Output::new(pin, Level::Low)),
         }
     }
 }
