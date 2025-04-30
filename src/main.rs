@@ -7,7 +7,8 @@ use dap_rs::jtag::TapConfig;
 use dap_rs::swo::Swo;
 use defmt::{todo, unwrap, warn};
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::join4;
+use embassy_futures::select::{Either, select};
 use embassy_rp::adc::{self, Adc};
 use embassy_rp::flash::Flash;
 use embassy_rp::gpio::{Flex, Input, Level, Output, Pin, Pull};
@@ -15,7 +16,9 @@ use embassy_rp::peripherals::{PIN_0, PIN_5, PWM_SLICE0, PWM_SLICE2, USB};
 use embassy_rp::pwm::{self, Pwm, SetDutyCycle};
 use embassy_rp::usb::{self, Driver as UsbDriver};
 use embassy_rp::{Peri, bind_interrupts};
-use embassy_time::{Duration, Ticker};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::cdc_acm::CdcAcmClass;
 use embassy_usb::class::cdc_acm::State;
 use embassy_usb::class::cmsis_dap_v2::{CmsisDapV2Class, State as CmsisDapV2State};
@@ -143,6 +146,26 @@ async fn main(_spawner: Spawner) {
     // Run the USB device.
     let usb_fut = usb.run();
 
+    // Create the LED controller.
+    static LED_SIGNALS: ConstStaticCell<LedSignals> = ConstStaticCell::new(LedSignals {
+        host_status: Signal::new(),
+        target_voltage: Signal::new(),
+    });
+    let led_signals = LED_SIGNALS.take();
+
+    let mut led_controller = LedController {
+        leds: Leds {
+            red: Output::new(p.PIN_28, Level::High),
+            green: Output::new(p.PIN_27, Level::High),
+            blue: Output::new(p.PIN_29, Level::High),
+        },
+        signals: led_signals,
+        state: LedState {
+            host_status: None,
+            target_voltage: None,
+        },
+    };
+
     // Now create the CMSIS-DAP handler.
 
     static SCAN_CHAIN: ConstStaticCell<[TapConfig; MAX_SCAN_CHAIN_LENGTH]> =
@@ -156,13 +179,10 @@ async fn main(_spawner: Spawner) {
         BitDelay,
         SCAN_CHAIN.take(),
     );
+
     let mut dap = Dap::new(
         deps,
-        Leds {
-            _red: Output::new(p.PIN_28, Level::High),
-            green: Output::new(p.PIN_27, Level::High),
-            blue: Output::new(p.PIN_29, Level::High),
-        },
+        &*led_signals,
         BitDelay,
         None::<NoSwo>,
         concat!("2.1.0, Adaptor version ", env!("CARGO_PKG_VERSION")),
@@ -208,13 +228,28 @@ async fn main(_spawner: Spawner) {
 
             defmt::trace!("Tracking Target VCC at {} mV", target_vcc_mv);
 
+            let target_voltage = if target_vcc_mv > 2500 {
+                Some(VTarget::Voltage3V3)
+            } else if target_vcc_mv > 1500 {
+                Some(VTarget::Voltage1V8)
+            } else {
+                if target_physically_connected.target_detected() {
+                    // If there is no VCC detected use 3.3v.
+                    Some(VTarget::Voltage3V3)
+                } else {
+                    None
+                }
+            };
+
+            led_signals.target_voltage.signal(target_voltage);
+
             ticker.next().await;
         }
     };
 
     // Run everything concurrently.
     // If we had made everything `'static` above instead, we could do this using separate tasks instead.
-    join3(usb_fut, dap_fut, voltage_control_fut).await;
+    join4(usb_fut, dap_fut, voltage_control_fut, led_controller.run()).await;
 }
 
 struct BitDelay;
@@ -279,18 +314,128 @@ impl InputOutputPin for IoPin<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, defmt::Format)]
+enum VTarget {
+    Voltage1V8,
+    Voltage3V3,
+}
+
+struct LedSignals {
+    host_status: Signal<ThreadModeRawMutex, dap::HostStatus>,
+    target_voltage: Signal<ThreadModeRawMutex, Option<VTarget>>,
+}
+
+struct LedState {
+    host_status: Option<dap::HostStatus>,
+    target_voltage: Option<VTarget>,
+}
+
 struct Leds<'a> {
-    _red: Output<'a>,
+    red: Output<'a>,
     green: Output<'a>,
     blue: Output<'a>,
 }
+impl Leds<'_> {
+    pub fn rgb(&mut self, r: bool, g: bool, b: bool) {
+        self.red.set_level(Level::from(r));
+        self.green.set_level(Level::from(g));
+        self.blue.set_level(Level::from(b));
+    }
 
-impl DapLeds for Leds<'_> {
-    fn react_to_host_status(&mut self, host_status: dap::HostStatus) {
-        match host_status {
-            dap::HostStatus::Connected(c) => self.green.set_level(Level::from(c)),
-            dap::HostStatus::Running(r) => self.blue.set_level(Level::from(r)),
+    pub fn red(&mut self) {
+        self.rgb(true, false, false);
+    }
+
+    /// R + G = yellow
+    pub fn yellow(&mut self) {
+        self.rgb(true, true, false);
+    }
+
+    pub fn green(&mut self) {
+        self.rgb(false, true, false);
+    }
+
+    pub fn blue(&mut self) {
+        self.rgb(false, false, true);
+    }
+
+    // R + B = purple-ish
+    pub fn pink(&mut self) {
+        self.rgb(true, false, true);
+    }
+
+    // R + G + B = white/purple
+    pub fn white(&mut self) {
+        self.rgb(true, true, true);
+    }
+}
+
+struct LedController<'a> {
+    leds: Leds<'a>,
+    signals: &'static LedSignals,
+    state: LedState,
+}
+
+impl<'a> LedController<'a> {
+    async fn run(&mut self) -> Self {
+        loop {
+            let is_activity = self.update().await;
+            if is_activity {
+                // Wait for a bit to make sure the signal can be seen.
+                Timer::after(Duration::from_millis(100)).await;
+            }
         }
+    }
+
+    async fn update(&mut self) -> bool {
+        let host_status_signal = self.signals.host_status.wait();
+        let target_voltage_signal = self.signals.target_voltage.wait();
+
+        match select(host_status_signal, target_voltage_signal).await {
+            Either::First(state) => self.state.host_status = Some(state),
+            Either::Second(voltage) => {
+                // A change in Vtarget means that a cable was re- or disconnected, in
+                // which case knowing the core status is impossible, so we just reset
+                // it to the default.
+                self.state.target_voltage = voltage;
+                self.state.host_status = None;
+            }
+        };
+
+        let is_activity = match (self.state.target_voltage, self.state.host_status.as_ref()) {
+            (Some(current_vtarget), None)
+            | (Some(current_vtarget), Some(dap::HostStatus::Connected(false))) => {
+                match current_vtarget {
+                    VTarget::Voltage1V8 => self.leds.pink(),
+                    VTarget::Voltage3V3 => self.leds.white(),
+                }
+                false
+            }
+            (_, Some(dap::HostStatus::Connected(true))) => {
+                self.leds.yellow();
+                true
+            }
+            (_, Some(dap::HostStatus::Running(false))) => {
+                self.leds.blue();
+                true
+            }
+            (_, Some(dap::HostStatus::Running(true))) => {
+                self.leds.green();
+                true
+            }
+            (None, _) => {
+                self.leds.red();
+                false
+            }
+        };
+
+        is_activity
+    }
+}
+
+impl DapLeds for &'static LedSignals {
+    fn react_to_host_status(&mut self, host_status: dap::HostStatus) {
+        self.host_status.signal(host_status);
     }
 }
 
